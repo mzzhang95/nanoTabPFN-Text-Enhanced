@@ -13,21 +13,65 @@ from sklearn.preprocessing import OrdinalEncoder, FunctionTransformer
 
 from tfmplayground.model import NanoTabPFNModel
 from tfmplayground.utils import get_default_device
+from tfmplayground.attn_v2 import MultiHeadAttention as PFNMultiHeadAttentionV2
 
 def init_model_from_state_dict_file(file_path):
-    """
-    reads model architecture from state dict, instantiates the architecture and loads the weights
-    """
-    state_dict = torch.load(file_path, map_location=torch.device('cpu'))
+    state_dict = torch.load(file_path, map_location=torch.device("cpu"))
     model = NanoTabPFNModel(
-        num_attention_heads=state_dict['architecture']['num_attention_heads'],
-        embedding_size=state_dict['architecture']['embedding_size'],
-        mlp_hidden_size=state_dict['architecture']['mlp_hidden_size'],
-        num_layers=state_dict['architecture']['num_layers'],
-        num_outputs=state_dict['architecture']['num_outputs'],
-    )
-    model.load_state_dict(state_dict['model'])
+    num_attention_heads=6,# state_dict['architecture']['num_attention_heads'],
+    embedding_size=192, # state_dict['architecture']['embedding_size'],
+    mlp_hidden_size=768, # state_dict['architecture']['mlp_hidden_size'],
+    num_layers=6, # state_dict['architecture']['num_layers'],
+    num_outputs=100, # state_dict['architecture']['num_outputs'],
+)
+
+    # Map torch MHA weights into PFN format for each block
+    for i in range(model.num_layers):
+        for kind in ["self_attention_between_datapoints", "self_attention_between_features"]:
+            prefix_old = f"transformer_encoder.transformer_blocks.{i}.{kind}"
+            prefix_new = f"{prefix_old}.core"
+            # pull torch weights
+            in_proj = state_dict.pop(f"{prefix_old}.in_proj_weight")
+            out_proj = state_dict.pop(f"{prefix_old}.out_proj.weight")
+            # optional bias keys can be popped/ignored if present
+            state_dict.pop(f"{prefix_old}.in_proj_bias", None)
+            state_dict.pop(f"{prefix_old}.out_proj.bias", None)
+            converted = PFNMultiHeadAttentionV2.convert_torch_nn_multihead_attention_state_dict(
+                {"in_proj_weight": in_proj, "out_proj.weight": out_proj},
+                nhead=model.num_attention_heads,
+            )
+            for k, v in converted.items():
+                state_dict[f"{prefix_new}.{k}"] = v
+    # Fill in new external_gate params with their initialized values if missing
+    model_init_state = model.state_dict()
+    for key, tensor in model_init_state.items():
+        if key.endswith("external_gate") and key not in state_dict:
+            state_dict[key] = tensor
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print("missing:", missing, "unexpected:", unexpected)
     return model
+
+# def init_model_from_state_dict_file(file_path):
+#     """
+#     reads model architecture from state dict, instantiates the architecture and loads the weights
+#     """
+#     # print(file_path)
+#     state_dict = torch.load(file_path, map_location=torch.device('cpu'))
+#     #print(state_dict.keys())
+
+#     model = NanoTabPFNModel(
+#         num_attention_heads=6,# state_dict['architecture']['num_attention_heads'],
+#         embedding_size=192, # state_dict['architecture']['embedding_size'],
+#         mlp_hidden_size=768, # state_dict['architecture']['mlp_hidden_size'],
+#         num_layers=6, # state_dict['architecture']['num_layers'],
+#         num_outputs=100, # state_dict['architecture']['num_outputs'],
+#     )
+#     # MZ: Added a new param, by pass checks
+#     # model.load_state_dict(state_dict)
+#     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+#     print("missing:", missing, "unexpected:", unexpected)
+#     return model
 
 # doing these as lambdas would cause NanoTabPFNClassifier to not be pickle-able,
 # which would cause issues if we want to run it inside the tabarena codebase
@@ -157,35 +201,52 @@ class NanoTabPFNRegressor():
         self.device = device
         self.dist = dist
         self.num_mem_chunks = num_mem_chunks
+        self.external_gate = 0.5  # weight for blending external attention if available
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray):
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_text: np.ndarray):
         """
         Stores X_train and y_train for later use.
         Computes target normalization.
         """
+        # MZ: the fit function only stores the training data, no forward pass is done here
+        # MZ: treat numerical features same as before
         self.feature_preprocessor = get_feature_preprocessor(X_train)
         self.X_train = self.feature_preprocessor.fit_transform(X_train)
         self.y_train = y_train
+
+        # MZ: our text enhanced module
+        self.X_text_train = np.array(X_text)
 
         self.y_train_mean = np.mean(self.y_train)
         self.y_train_std = np.std(self.y_train, ddof=1) + 1e-8
         self.y_train_n = (self.y_train - self.y_train_mean) / self.y_train_std
 
-    def predict(self, X_test: np.ndarray) -> np.ndarray:
+    def predict(self, X_test: np.ndarray, X_text_test: np.ndarray) -> np.ndarray:
         """
         Performs in-context learning using X_train and y_train.
+        MZ: Pass text embeddings of test data for textenhanced attention calculation.
         Predicts the means of the output distributions for X_test.
         Renormalizes the predictions back to the original target scale.
         """
+        # MZ: treat numerical features same as before
         X = np.concatenate((self.X_train, self.feature_preprocessor.transform(X_test)))
         y = self.y_train_n
+
+        attn_weight_external = self._compute_attn_weight_external(X_text_test)
 
         with torch.no_grad():
             X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)
             y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-            logits = self.model((X_tensor, y_tensor), single_eval_pos=len(self.X_train), num_mem_chunks=self.num_mem_chunks).squeeze(0)
+            logits = self.model(
+                (X_tensor, y_tensor),
+                single_eval_pos=len(self.X_train),
+                num_mem_chunks=self.num_mem_chunks,
+                attn_weight_external=attn_weight_external,
+                external_gate=self.external_gate,
+            ).squeeze(0)
             preds_n = self.dist.mean(logits)
             preds = preds_n * self.y_train_std + self.y_train_mean
 
         return preds.cpu().numpy()
+    
