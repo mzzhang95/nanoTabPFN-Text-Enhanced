@@ -250,3 +250,29 @@ class NanoTabPFNRegressor():
 
         return preds.cpu().numpy()
     
+    def _compute_attn_weight_external(self, X_text_test: np.ndarray) -> torch.Tensor:
+        """
+        Computes external attention weights from text features for train+test rows.
+        Returns a tensor of shape (1, L, L) on the model device.
+        """
+        X_text_full = np.concatenate((self.X_text_train, np.array(X_text_test)))
+        X_tensor = torch.tensor(X_text_full, dtype=torch.float32, device=self.device)  # [L, F_text]
+        X_norm = torch.nn.functional.normalize(X_tensor, dim=1)
+        sim = X_norm @ X_norm.T  # [L, L]
+        attn = torch.softmax(sim, dim=-1).unsqueeze(0)  # [1, L, L]
+        return attn
+
+    def build_fake_attn_weight(self, num_test_rows: int, fill_value: float = 0.0) -> torch.Tensor:
+        """
+        Utility to create a fake external attention weight when no text is available.
+        Produces a uniform (softmaxed) matrix of shape (1, L, L) on the correct device.
+        """
+        train_len = len(self.X_train)
+        total_len = train_len + num_test_rows
+        base = torch.full(
+            (1, total_len, total_len),
+            fill_value,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return torch.softmax(base, dim=-1)

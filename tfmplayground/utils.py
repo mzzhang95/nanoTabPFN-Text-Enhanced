@@ -13,7 +13,9 @@ def set_randomness_seed(seed):
 def get_default_device():
     device = 'cpu'
     if torch.backends.mps.is_available(): device = 'mps'
-    if torch.cuda.is_available(): device = 'cuda'
+    if torch.cuda.is_available(): 
+        print('using GPU backend')
+        device = 'cuda'
     return device
 
 def make_global_bucket_edges(filename, n_buckets=100, device=get_default_device(), max_y=5_000_000):

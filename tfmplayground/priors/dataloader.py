@@ -9,7 +9,7 @@ from ticl.dataloader import PriorDataLoader as TICLPriorDataset
 from torch.utils.data import DataLoader
 
 
-class PriorDataLoader(DataLoader):
+class PriorDataLoader(DataLoader): 
     """Generic DataLoader for synthetic data generation using a get_batch function.
 
     Args:
