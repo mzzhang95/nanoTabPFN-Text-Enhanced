@@ -201,7 +201,8 @@ class NanoTabPFNRegressor():
         self.device = device
         self.dist = dist
         self.num_mem_chunks = num_mem_chunks
-        self.external_gate = 0.5  # weight for blending external attention if available
+        # Keep external_gate None to use the model's trainable gate parameter.
+        self.external_gate: float | None = None
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_text: np.ndarray):
         """
