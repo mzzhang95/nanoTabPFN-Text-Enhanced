@@ -152,12 +152,16 @@ class TargetEncoder(nn.Module):
 
 
 class TransformerEncoderStack(nn.Module):
+    # MZ: hardcoded to use text enhanced attention in the last layer only
     def __init__(self, num_layers: int, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int):
         """ Instantiates num_layers many Transformer Blocks and stores them in a list so we can use them in the forward """
         super().__init__()
         self.transformer_blocks = nn.ModuleList()
-        for _ in range(num_layers):
+        for _ in range(num_layers)-1:
             self.transformer_blocks.append(TransformerEncoderLayer(embedding_size, num_attention_heads, mlp_hidden_size))
+
+        # MZ: last layer uses text enhanced attention
+        self.transformer_blocks.append(TransformerEncoderLayer(embedding_size, num_attention_heads, mlp_hidden_size, text_enhanced=True))
 
     def forward(
         self,
@@ -181,14 +185,21 @@ class TransformerEncoderStack(nn.Module):
             (torch.Tensor) a tensor of shape (batch_size, num_rows, num_features, embedding_size)
         """
         for i, block in enumerate(self.transformer_blocks):
-            use_external = i == len(self.transformer_blocks) - 1
-            x = block(
-                x,
-                single_eval_position=single_eval_position,
-                num_mem_chunks=num_mem_chunks,
-                attn_weight_external=attn_weight_external if use_external else None,
-                external_gate=external_gate if use_external else None,
-            )
+            # MZ: last block uses external attention
+            if i == len(self.transformer_blocks) - 1:
+                x = block(
+                    x,
+                    single_eval_position=single_eval_position,
+                    num_mem_chunks=num_mem_chunks,
+                    attn_weight_external=attn_weight_external,
+                    external_gate=external_gate,
+                )
+            else:
+                x = block(
+                    x,
+                    single_eval_position=single_eval_position,
+                    num_mem_chunks=num_mem_chunks,
+                )
         return x
 
 
@@ -214,6 +225,7 @@ class TransformerEncoderLayer(nn.Module):
             bias=False,
             text_enhanced=text_enhanced,
         )
+        # MZ: no text enhanced attention for feature attention
         self.self_attention_between_features = PFNMultiheadAttentionV2Wrapper(
             embedding_size,
             nhead,
@@ -222,9 +234,12 @@ class TransformerEncoderLayer(nn.Module):
             dtype=dtype,
             bias=False,
         )
-        # Trainable gate for blending external attention when provided
-        init_gate = torch.tensor(0.5, device=device, dtype=dtype) if dtype is not None else torch.tensor(0.5, device=device)
-        self.external_gate = nn.Parameter(init_gate)
+        # MZ: set external gate to 0.5 as initial value
+        if text_enhanced:
+            init_gate = torch.tensor(0.5, device=device, dtype=dtype) if dtype is not None else torch.tensor(0.5, device=device)
+            self.external_gate = nn.Parameter(init_gate)
+        else:
+            self.external_gate = None
 
         self.linear1 = Linear(embedding_size, mlp_hidden_size, device=device, dtype=dtype)
         self.linear2 = Linear(mlp_hidden_size, embedding_size, device=device, dtype=dtype)
@@ -239,8 +254,9 @@ class TransformerEncoderLayer(nn.Module):
         single_eval_position: int,
         num_mem_chunks: int = 1,
         *,
-        attn_weight_external: torch.Tensor | None = None,
-        external_gate: float | None = None,
+        text_attn_weight: torch.Tensor | None = None,
+        # MZ: removed external_gate argument since it is now a trainable parameter
+        # external_gate: float | None = None,
     ) -> torch.Tensor:
         """
         Takes the embeddings of the table as input and applies self-attention between features and self-attention between datapoints
@@ -256,8 +272,6 @@ class TransformerEncoderLayer(nn.Module):
             (torch.Tensor) a tensor of shape (batch_size, num_rows, num_features, embedding_size)
         """
         batch_size, rows_size, col_size, embedding_size = src.shape
-        gate = external_gate if external_gate is not None else self.external_gate
-        external_enabled = attn_weight_external is not None
 
         # attention between features
         src = src.reshape(batch_size*rows_size, col_size, embedding_size)
@@ -278,25 +292,24 @@ class TransformerEncoderLayer(nn.Module):
         src = src.reshape(batch_size*col_size, rows_size, embedding_size)
         @memory_chunking(num_mem_chunks)
         def datapoint_attention(x):
-            attn_train = attn_test = None
-            if external_enabled:
-                attn_train = attn_weight_external[:, :single_eval_position, :single_eval_position]
-                attn_test = attn_weight_external[:, single_eval_position:, :single_eval_position]
+            # MZ: flag constant to indicate whether external attention is enabled
+            external_enabled = text_attn_weight is not None and self.external_gate is not None
 
+            # MZ: No text enhanced attention for training data
             x_left = self.self_attention_between_datapoints(
                 x[:, :single_eval_position],
                 x[:, :single_eval_position],
                 x[:, :single_eval_position],
-                attn_weight_external=attn_train,
-                external_gate=gate if external_enabled else None,
+                attn_weight_external=None,
+                external_gate=None,
             )[0]
-            # test data attends to the training data
+            # MZ: test data attends to the training data with external attention
             x_right = self.self_attention_between_datapoints(
                 x[:, single_eval_position:],
                 x[:, :single_eval_position],
                 x[:, :single_eval_position],
-                attn_weight_external=attn_test,
-                external_gate=gate if external_enabled else None,
+                attn_weight_external=text_attn_weight if external_enabled else None,
+                external_gate=self.external_gate if external_enabled else None,
             )[0]
             return torch.cat([x_left, x_right], dim=1) + x
         src = datapoint_attention(src)
