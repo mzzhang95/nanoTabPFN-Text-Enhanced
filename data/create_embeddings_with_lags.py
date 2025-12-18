@@ -2,6 +2,9 @@
 Create embeddings with lagged text features for the climate CSV. Should be extended to other dataframes easily in the future.
 
 Note: onlt raw data should be uploaded to our repo.
+
+MZ: Missing text is filled with the literal string ``n/a`` so we never use an all-zero
+vector placeholder for unavailable text features., e.g. for the first few rows where lagged text is not available.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 # Fixed configuration (edit here if needed)
-csv_path ="./climate_ttc/climate_2014_2023_final.csv"
+csv_path = "./climate_ttc/climate_2014_2023_final.csv"
 text_column = "text"
 model_name = "Qwen/Qwen3-Embedding-0.6B"
 lag_days = 3  # number of prior days to include (in addition to current)
@@ -21,6 +24,13 @@ batch_size = 16
 max_length = 1024
 device = "cuda" if torch.cuda.is_available() else "cpu"
 output_csv_path = f"./climate_ttc/climate_2014_2023_final_with_embeddings_lag_{lag_days}.csv"
+na_text = "n/a"
+
+
+def sanitize_text_series(series: pd.Series) -> pd.Series:
+    # MZ: Replace NaN or empty strings with na_text. Make it a function for reusability and flexibility.
+    series = series.fillna("").astype(str).str.strip()
+    return series.mask(series == "", na_text)
 
 
 
@@ -32,6 +42,7 @@ def embed_texts(texts: List[str]) -> torch.Tensor:
         batch_size=batch_size,
         convert_to_tensor=True,
         show_progress_bar=True,
+        # MZ: TODO: try both with and without normalization
         normalize_embeddings=False,
     )
     return embeddings.cpu()
@@ -54,7 +65,7 @@ def main():
         else:
             # get lag feaute by shifting lag days
             df[col_name] = df[text_column].shift(lag)
-        df[col_name] = df[col_name].fillna("").astype(str)
+        df[col_name] = sanitize_text_series(df[col_name])
         lag_text_cols.append(col_name)
 
     print(
