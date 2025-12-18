@@ -13,7 +13,7 @@ from sklearn.preprocessing import OrdinalEncoder, FunctionTransformer
 
 from tfmplayground.model import NanoTabPFNModel
 from tfmplayground.utils import get_default_device
-from tfmplayground.attn_v2 import MultiHeadAttention as PFNMultiHeadAttentionV2
+from tfmplayground.attn_v2 import PFNMultiHeadAttentionV2
 
 def init_model_from_state_dict_file(file_path):
     state_dict = torch.load(file_path, map_location=torch.device("cpu"))
@@ -173,7 +173,15 @@ class NanoTabPFNClassifier():
 
 class NanoTabPFNRegressor():
     """ scikit-learn like interface """
-    def __init__(self, model: NanoTabPFNModel|str|None = None, dist: FullSupportBarDistribution|str|None = None, device: str|torch.device|None = None, num_mem_chunks: int = 8):
+    def __init__(
+        self,
+        model: NanoTabPFNModel | str | None = None,
+        dist: FullSupportBarDistribution | str | None = None,
+        device: str | torch.device | None = None,
+        num_mem_chunks: int = 8,
+        *,
+        use_text_attn: bool = True,
+    ):
         if device is None:
             device = get_default_device()
         if model is None:
@@ -201,8 +209,7 @@ class NanoTabPFNRegressor():
         self.device = device
         self.dist = dist
         self.num_mem_chunks = num_mem_chunks
-        # Keep external_gate None to use the model's trainable gate parameter.
-        self.external_gate: float | None = None
+        self.use_text_attn = use_text_attn
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, train_text: np.ndarray):
         """
@@ -229,7 +236,40 @@ class NanoTabPFNRegressor():
         self.y_train_std = np.std(self.y_train, ddof=1) + 1e-8
         self.y_train_n = (self.y_train - self.y_train_mean) / self.y_train_std
 
-    def predict(self, X_test: np.ndarray, text_test: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def build_fake_attn_weight_external(
+        n_test: int,
+        n_train: int,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Return uniform external attention weights shaped (1, N_test, N_train)."""
+        if n_train <= 0:
+            raise ValueError("n_train must be > 0")
+        attn = torch.full((1, n_test, n_train), 1.0 / float(n_train), device=device, dtype=dtype)
+        return attn
+
+    def _coerce_attn_weight_external(self, attn_weight_external: np.ndarray | torch.Tensor) -> torch.Tensor:
+        """Coerce external attention to a torch.Tensor shaped (1, N_test, N_train) on self.device."""
+        if isinstance(attn_weight_external, np.ndarray):
+            attn = torch.tensor(attn_weight_external, dtype=torch.float32, device=self.device)
+        else:
+            attn = attn_weight_external.to(self.device)
+        if attn.dim() == 2:
+            attn = attn.unsqueeze(0)
+        if attn.dim() != 3 or attn.shape[0] != 1:
+            raise ValueError(f"attn_weight_external must be shaped (N_test,N_train) or (1,N_test,N_train); got {tuple(attn.shape)}")
+        return attn
+
+    def predict(
+        self,
+        X_test: np.ndarray,
+        text_test: np.ndarray | None = None,
+        *,
+        use_text_attn: bool | None = None,
+        attn_weight_external: np.ndarray | torch.Tensor | None = None,
+    ) -> np.ndarray:
         """
         Performs in-context learning using X_train and y_train.
         MZ: Pass text embeddings of test data for textenhanced attention calculation.
@@ -240,7 +280,17 @@ class NanoTabPFNRegressor():
         X = np.concatenate((self.X_train, self.feature_preprocessor.transform(X_test)))
         y = self.y_train_n
 
-        attn_weight_external = self._compute_attn_weight_external(text_test)
+        if use_text_attn is None:
+            use_text_attn = self.use_text_attn
+
+        if attn_weight_external is not None:
+            attn_weight_external_t = self._coerce_attn_weight_external(attn_weight_external)
+        elif use_text_attn:
+            if text_test is None:
+                raise ValueError("text_test must be provided when use_text_attn=True and attn_weight_external is None.")
+            attn_weight_external_t = self._compute_attn_weight_external(text_test)
+        else:
+            attn_weight_external_t = None
 
         with torch.no_grad():
             X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -250,7 +300,7 @@ class NanoTabPFNRegressor():
                 (X_tensor, y_tensor),
                 single_eval_pos=len(self.X_train),
                 num_mem_chunks=self.num_mem_chunks,
-                attn_weight_external=attn_weight_external,
+                attn_weight_external=attn_weight_external_t,
             ).squeeze(0)
             preds_n = self.dist.mean(logits)
             preds = preds_n * self.y_train_std + self.y_train_mean
@@ -292,7 +342,6 @@ class NanoTabPFNRegressor():
 
         if train.shape[1:] != test.shape[1:]:
             raise ValueError(
-                "Train/test text embeddings must match on (T, D). "
                 f"Got train={train.shape}, test={test.shape}."
             )
 

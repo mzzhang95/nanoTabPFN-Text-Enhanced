@@ -3,3 +3,4 @@
 # TODO: a data preprocess function that get look back window days' embedding and append to a row
 # TODO: add a combination of all look back window days' text into one embedding - This has to be done on fly
 # TODO: TODO: how to deal with empty text feature? how to get text_similarity bewteen a dp with a lag text feature n/a
+# TODO: Fine-tuning - tuning strategy

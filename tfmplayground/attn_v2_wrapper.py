@@ -1,100 +1,97 @@
-import math
 from typing import Optional
 
 import torch
 from torch import nn
 
-from tfmplayground.attn_v2 import PFNAttentionConfig, MultiHeadAttention as PFNMultiHeadAttentionV2
+from tfmplayground.attn_v2 import PFNAttentionConfig, PFNMultiHeadAttentionV2
 
+def _attention_probs_and_head_output(  # noqa: PLR0913
+    *,
+    q: torch.Tensor | None,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
+    kv: torch.Tensor | None,
+    qkv: torch.Tensor | None,
+    dropout_p: float | None,
+    softmax_scale: float | None,
+    training: bool,
+    attn_weight_external: torch.Tensor | None,
+    external_gate: torch.Tensor | float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute (attention_probs, head_output) with optional external blending.
 
-class _PFNMultiHeadAttentionV2Safe(PFNMultiHeadAttentionV2):
-    """MZ: All further updates are made to PFNMultiHeadAttentionV2 to make it safe.
-       No update on PFNMultiHeadAttentionV2 itself should be made."""
+    - attention_probs: [B, Lq, Lk, H]
+    - head_output: [B, Lq, H, d_v]
+    """
+    assert (k is None) == (v is None)
+    assert sum([qkv is None, kv is None, k is None and v is None]) == 2
+    assert (qkv is None) != (q is None)
 
-    def forward(  # noqa: PLR0913
-        self,
-        x: torch.Tensor,
-        x_kv: torch.Tensor | None = None, 
-        *,
-        cache_kv: bool = False,
-        add_input: bool = False,
-        allow_inplace: bool = False,  # ignored
-        reuse_first_head_kv: bool = False,
-        only_cache_first_head_kv: bool = False,
-        use_cached_kv: bool = False,
-        attn_weight_external: torch.Tensor | None = None,
-        external_gate: float | None = None,
-    ) -> torch.Tensor:
-        assert not (cache_kv and use_cached_kv), "Cannot cache and use cached keys and values at the same time."
-        assert not x.requires_grad or (not self.has_cached_kv and not cache_kv), (
-            "Saving keys and values is only supported during inference."
-        )
-        x, x_kv, x_shape_after_transpose = self._rearrange_inputs_to_flat_batch(x, x_kv)
+    if qkv is not None:
+        q, k, v = qkv.unbind(dim=-3)
+    elif kv is not None:
+        k, v = kv.unbind(dim=-3)
 
-        nhead_kv = 1 if reuse_first_head_kv else self._nhead_kv
+    assert q is not None
+    assert k is not None
+    assert v is not None
 
-        if cache_kv:
-            self._k_cache = self._v_cache = self._kv_cache = None
-            if x_kv is not None:
-                batch_size, seqlen_kv = x_kv.shape[:2]
-            else:
-                batch_size, seqlen_kv = x.shape[:2]
+    # Apply external (text-enhanced) attention only when both tensors are provided.
+    # If either is missing, fall back to regular attention.
+    if attn_weight_external is None or external_gate is None:
+        attn_weight_external = None
+        external_gate = None
 
-            if self._w_kv is not None or self._w_qkv is not None:
-                self._kv_cache = torch.empty(
-                    batch_size,
-                    seqlen_kv,
-                    2,
-                    1 if only_cache_first_head_kv else nhead_kv,
-                    self._d_k,
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-            else:
-                self._k_cache = torch.empty(
-                    batch_size,
-                    seqlen_kv,
-                    nhead_kv,
-                    self._d_k,
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-                self._v_cache = torch.empty(
-                    batch_size,
-                    seqlen_kv,
-                    nhead_kv,
-                    self._d_v,
-                    device=x.device,
-                    dtype=x.dtype,
-                )
+    batch_size, seqlen_q, nhead, d_k = q.shape
+    _, seqlen_kv, nhead_kv, d_v = v.shape
+    share_kv_across_n_heads = nhead // nhead_kv
 
-        q, k, v, kv, qkv = self.compute_qkv(
-            x,
-            x_kv,
-            self._k_cache,
-            self._v_cache,
-            self._kv_cache,
-            cache_kv=cache_kv,
-            use_cached_kv=use_cached_kv,
-            reuse_first_head_kv=reuse_first_head_kv,
-        )
-        attention_head_outputs = self.compute_attention_heads(
-            q,
-            k,
-            v,
-            kv,
-            qkv,
-            self.dropout_p,
-            self.softmax_scale,
-            attn_weight_external=attn_weight_external,
-            external_gate=external_gate,
-        )
-        output = torch.einsum("... h d, h d s -> ... s", attention_head_outputs, self._w_out)
-        if add_input:
-            output = output + x
-        if allow_inplace:
-            return output
-        return output.reshape(x_shape_after_transpose[:-1] + output.shape[-1:])
+    if dropout_p is None:
+        dropout_p = 0.0
+
+    # Broadcast kv heads (GQA/MQA) to full heads for manual attention.
+    k = PFNMultiHeadAttentionV2.broadcast_kv_across_heads(k, share_kv_across_n_heads)
+    v = PFNMultiHeadAttentionV2.broadcast_kv_across_heads(v, share_kv_across_n_heads)
+
+    logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
+    if softmax_scale is None:
+        logits *= torch.sqrt(torch.tensor(1.0 / d_k, device=logits.device, dtype=logits.dtype))
+    else:
+        logits *= softmax_scale
+
+    ps = torch.softmax(logits, dim=2)  # [B, Lq, Lk, H]
+    ps = torch.dropout(ps, dropout_p, train=training)
+
+    if attn_weight_external is not None and external_gate is not None:
+        gate = external_gate
+        if not isinstance(gate, torch.Tensor):
+            gate = torch.tensor(gate, device=ps.device, dtype=ps.dtype)
+        # Accept per-head gate shapes:
+        # - [H] -> [1,1,1,H]
+        # - [1,H,1,1] -> [1,1,1,H]
+        if gate.dim() == 1 and gate.numel() == nhead:
+            gate = gate.view(1, 1, 1, nhead)
+        elif gate.dim() == 4 and gate.shape[1] == nhead and gate.shape[2] == 1 and gate.shape[3] == 1:
+            gate = gate.permute(0, 2, 3, 1)  # [1,1,1,H]
+
+        ext = attn_weight_external
+        # if ext.dim() == 2:
+        #     ext = ext.unsqueeze(0)
+        # if ext.shape[0] == 1 and batch_size > 1:
+        #     ext = ext.expand(batch_size, -1, -1)
+        # if ext.shape[:3] != (batch_size, seqlen_q, seqlen_kv):
+        #     raise ValueError(
+        #         f"attn_weight_external must have shape [B, Lq, Lk] = "
+        #         f"[{batch_size}, {seqlen_q}, {seqlen_kv}], got {tuple(ext.shape)}"
+        #     )
+        ext = ext.unsqueeze(-1).expand(-1, -1, -1, nhead)  # [B, Lq, Lk, H]
+        ps = gate * ps + (1.0 - gate) * ext
+
+    head_output = torch.einsum("b q k h, b k h d -> b q h d", ps, v).reshape(
+        batch_size, seqlen_q, nhead, d_v
+    )
+    return ps, head_output
 
 
 class PFNMultiheadAttentionV2Wrapper(nn.Module):
@@ -117,8 +114,8 @@ class PFNMultiheadAttentionV2Wrapper(nn.Module):
         config: PFNAttentionConfig | None = None,
         softmax_scale: float | None = None,
         reuse_first_head_kv: bool = False,
-        # MZ: added text_enhanced flag to decide if the encoder layer should be initialized with text enhanced attention
-        text_enhanced: bool = False,
+        # When False, ignores attn_weight_external even if provided.
+        text_enhanced: bool = True,
     ) -> None:
         super().__init__()
         if bias:
@@ -138,8 +135,9 @@ class PFNMultiheadAttentionV2Wrapper(nn.Module):
             raise ValueError("embed_dim must be divisible by num_heads")
 
         self.reuse_first_head_kv = reuse_first_head_kv
+        self.text_enhanced = text_enhanced
         self.config = config or PFNAttentionConfig(emsize=embed_dim, nhead=num_heads)
-        self.core = _PFNMultiHeadAttentionV2Safe(
+        self.core = PFNMultiHeadAttentionV2(
             d_k=self.head_dim,
             d_v=self.head_dim,
             device=device,
@@ -151,6 +149,39 @@ class PFNMultiheadAttentionV2Wrapper(nn.Module):
 
     def _maybe_transpose(self, tensor: torch.Tensor, batch_first: bool) -> torch.Tensor:
         return tensor if batch_first else tensor.transpose(0, 1)
+
+    def _forward_attention(  # noqa: PLR0913
+        self,
+        query_b: torch.Tensor,
+        key_b: torch.Tensor,
+        *,
+        attn_weight_external: torch.Tensor | None,
+        external_gate: torch.Tensor | float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q, k, v, kv, qkv = self.core.compute_qkv(
+            query_b,
+            key_b,
+            None,
+            None,
+            None,
+            cache_kv=False,
+            use_cached_kv=False,
+            reuse_first_head_kv=self.reuse_first_head_kv,
+        )
+        probs_bqkh, head_output = _attention_probs_and_head_output(
+            q=q,
+            k=k,
+            v=v,
+            kv=kv,
+            qkv=qkv,
+            dropout_p=self.core.dropout_p,
+            softmax_scale=self.core.softmax_scale,
+            training=self.training,
+            attn_weight_external=attn_weight_external,
+            external_gate=external_gate,
+        )
+        attn_output = torch.einsum("b q h d, h d s -> b q s", head_output, self.core.w_out)
+        return attn_output, probs_bqkh
 
     def forward(  # noqa: PLR0913
         self,
@@ -164,48 +195,34 @@ class PFNMultiheadAttentionV2Wrapper(nn.Module):
         is_causal: bool = False,
         *,
         attn_weight_external: torch.Tensor | None = None,
-        external_gate: float | None = None,
+        external_gate: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if attn_mask is not None or key_padding_mask is not None or is_causal:
             raise NotImplementedError("Masks/causal attention are not implemented for PFNMultiHeadAttentionV2.")
 
+        # PFN attention uses x_kv for both key and value. We ignore `value` unless it is actually needed.
+        if value.shape != key.shape:
+            raise ValueError(f"PFNMultiHeadAttentionV2 requires key/value shapes to match; got key={tuple(key.shape)} value={tuple(value.shape)}")
+
         query_b = self._maybe_transpose(query, self.batch_first)
         key_b = self._maybe_transpose(key, self.batch_first)
 
-        attn_output = self.core(
+        if not self.text_enhanced:
+            attn_weight_external = None
+            external_gate = None
+
+        attn_output, probs_bqkh = self._forward_attention(
             query_b,
-            x_kv=key_b,
-            reuse_first_head_kv=self.reuse_first_head_kv,
+            key_b,
             attn_weight_external=attn_weight_external,
             external_gate=external_gate,
         )
 
-        attn_weights = None
         if need_weights:
-            q, k, v, kv, qkv = self.core.compute_qkv(
-                query_b,
-                key_b,
-                None,
-                None,
-                None,
-                cache_kv=False,
-                use_cached_kv=False,
-                reuse_first_head_kv=self.reuse_first_head_kv,
-            )
-            if qkv is not None:
-                q, k, v = qkv.unbind(dim=-3)
-            elif kv is not None:
-                k, v = kv.unbind(dim=-3)
+            ps = probs_bqkh.permute(0, 3, 1, 2)  # [B, H, Lq, Lk]
+            attn_weights = ps.mean(dim=1) if average_attn_weights else ps
+        else:
+            attn_weights = None
 
-            if q is None or k is None:
-                raise RuntimeError("Unable to compute attention weights because Q/K are missing.")
-
-            logits = torch.einsum("b q h d, b k h d -> b h q k", q, k)
-            logits = logits / math.sqrt(self.head_dim)
-            attn_weights = torch.softmax(logits, dim=-1)
-            if average_attn_weights:
-                attn_weights = attn_weights.mean(dim=1)
-
-        # attn_output = self._maybe_transpose(attn_output, not self.batch_first)
         attn_output = self._maybe_transpose(attn_output, self.batch_first)
         return attn_output, attn_weights

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math
 from functools import partial
@@ -62,23 +63,62 @@ def _gqa_is_supported() -> bool:
 # Cache the GQA support check at module level
 USE_TORCH_2_GQA = _gqa_is_supported()
 
-class Attention(nn.Module):
+class Attention(ABC, nn.Module):
     """Base class for attention layers."""
 
     @override
-    def forward(  # pragma: no cover - interface only
+    @abstractmethod
+    def forward(
         self,
         x: torch.Tensor,
-        x_kv: Optional[torch.Tensor] = None,
+        x_kv: torch.Tensor | None = None,
         *,
         cache_kv: bool = False,
         use_cached_kv: bool = False,
         reuse_first_head_kv: bool = False,
         only_cache_first_head_kv: bool = False,
+        save_peak_mem_factor: int | None = None,
+        add_input: bool = False,
+        allow_inplace: bool = False,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        """Performs the attention layer.
 
-class MultiHeadAttention(Attention):
+        Args:
+            x: Input sequence of embeddings with shape
+                [batch... x query seq len x embedding dim].
+                If `x_kv` is None, this is used to compute the queries, keys, and
+                values.
+                If `x_kv` is not None, this is used to compute the queries only.
+            x_kv: If not None, an input sequence of embeddings with shape
+                [batch... x kv seq len x embedding dim].
+                It will be used to compute the keys and the values, with `x` used only
+                to compute the queries. This is useful to avoid some sequence positions
+                attending to others.
+            cache_kv: If True, replaces the current key-value cache with the keys and
+                values computed during this forward pass. Otherwise, the KV cache is
+                left unchanged. If True, `use_cached_kv` must be False.
+            use_cached_kv: If True, uses the keys and values cached during a previous
+                forward pass when `cache_kv` was True. If True, `cache_kv` must be
+                False.
+            reuse_first_head_kv: If True, then uses the keys and values projected in the
+                first head for all the heads.
+            only_cache_first_head_kv: When True, only caches the keys and values of the
+                first head.
+            save_peak_mem_factor: Loops over the batch dimension rather than processing
+                it in parallel, to reduce memory usage.
+            add_input: If True, returns (x+the output of attention), i.e. enables a
+                residual connection. If False, just returns the output of attention.
+            allow_inplace: By setting this to True, the caller indicates that 'x' is not
+                used after the call and its buffer can be reused for the output.
+                The operation is not guaranteed to be inplace.
+
+        Returns:
+            Output hidden states of shape [batch x query seq len x embedding dim]
+        """
+        ...
+
+        
+class PFNMultiHeadAttentionV2(Attention):
     _input_size: int
     _output_size: int
     _nhead: int
@@ -215,9 +255,7 @@ class MultiHeadAttention(Attention):
         d_v: int,
         device: torch.device | None,
         dtype: torch.dtype | None,
-        # MZ: Replaced with custom PFNConfig
         config: PFNAttentionConfig,
-        # config: ModelConfig,
         share_kv_across_n_heads: int = 1,
         dropout_p: float | None = None,
         softmax_scale: float | None = None,
@@ -319,7 +357,7 @@ class MultiHeadAttention(Attention):
         allow_inplace: bool = False,
         # This requires 'add_input' and 'allow_inplace'. See the documentation of
         # the decorator 'support_save_peak_mem_factor' for details.
-        # save_peak_mem_factor: int | None = None,
+        save_peak_mem_factor: int | None = None,
         reuse_first_head_kv: bool = False,
         only_cache_first_head_kv: bool = False,
         use_cached_kv: bool = False,
@@ -389,10 +427,8 @@ class MultiHeadAttention(Attention):
             self._kv_cache,
             cache_kv=cache_kv,
             use_cached_kv=use_cached_kv,
-            # MZ: comment out to bypass error; TODO: figure out why
-            # add_input=add_input,
-            # allow_inplace=allow_inplace,
-            # MZ: commented out
+            add_input=add_input,
+            allow_inplace=allow_inplace,
             # save_peak_mem_factor=save_peak_mem_factor,
             reuse_first_head_kv=reuse_first_head_kv,
         )
@@ -533,7 +569,7 @@ class MultiHeadAttention(Attention):
             use_cached_kv=use_cached_kv,
             reuse_first_head_kv=reuse_first_head_kv,
         )
-        attention_head_outputs = MultiHeadAttention.compute_attention_heads(
+        attention_head_outputs = PFNMultiHeadAttentionV2.compute_attention_heads(
             q,
             k,
             v,
@@ -635,10 +671,6 @@ class MultiHeadAttention(Attention):
         qkv: torch.Tensor | None,
         dropout_p: float | None = None,
         softmax_scale: float | None = None,
-        # text enhanced attention weight
-        attn_weight_external: torch.Tensor | None = None,
-        # weight between numerical attention weight & text attention weight
-        external_gate: float | None = None,                
     ) -> torch.Tensor:
         assert (k is None) == (v is None)
         assert sum([qkv is None, kv is None, k is None and v is None]) == 2
@@ -653,20 +685,13 @@ class MultiHeadAttention(Attention):
         assert k is not None
         assert v is not None
 
-        # checks if both attn_weight_external & external_gate are present or not
-        assert (attn_weight_external is None) == (external_gate is None)
-
         batch_size, seqlen_q, nhead, d_k = q.shape
         _, _seqlen_kv, nhead_kv, d_v = v.shape
         share_kv_across_n_heads = nhead // nhead_kv
         if dropout_p is None:
             dropout_p = 0.0  # TODO: necessary?
 
-        # use external attn or not
-        use_external = attn_weight_external is not None and external_gate is not None
-
-        # if there is no attn_weight passed to the function, use original falsh attn
-        if TORCH_2_ATTENTION_POSSIBLE and not use_external:
+        if TORCH_2_ATTENTION_POSSIBLE:
             extra_inputs = {}
             if softmax_scale is not None:
                 extra_inputs["scale"] = (
@@ -677,17 +702,17 @@ class MultiHeadAttention(Attention):
             if USE_TORCH_2_GQA:
                 extra_inputs["enable_gqa"] = True
             else:
-                k = MultiHeadAttention.broadcast_kv_across_heads(
+                k = PFNMultiHeadAttentionV2.broadcast_kv_across_heads(
                     k,
                     share_kv_across_n_heads,
                 )
-                v = MultiHeadAttention.broadcast_kv_across_heads(
+                v = PFNMultiHeadAttentionV2.broadcast_kv_across_heads(
                     v,
                     share_kv_across_n_heads,
                 )
 
             attention_head_outputs = (
-                MultiHeadAttention.scaled_dot_product_attention_chunked(
+                PFNMultiHeadAttentionV2.scaled_dot_product_attention_chunked(
                     q.transpose(1, 2),
                     k.transpose(1, 2),
                     v.transpose(1, 2),
@@ -696,32 +721,20 @@ class MultiHeadAttention(Attention):
                 )
             )
             attention_head_outputs = attention_head_outputs.transpose(1, 2)
-        # use external attention
-        # the attention is calculated manually by broadcasting K, V to multiple heads.
-        # the logits are available, we could use the logits for other fusion methods
+
         else:
-            k = MultiHeadAttention.broadcast_kv_across_heads(k, share_kv_across_n_heads)
-            v = MultiHeadAttention.broadcast_kv_across_heads(v, share_kv_across_n_heads)
+            k = PFNMultiHeadAttentionV2.broadcast_kv_across_heads(k, share_kv_across_n_heads)
+            v = PFNMultiHeadAttentionV2.broadcast_kv_across_heads(v, share_kv_across_n_heads)
             logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
-            # apply d_k^1/2 to the logit
             logits *= (
                 torch.sqrt(torch.tensor(1.0 / d_k)).to(k.device)
                 if softmax_scale is None
                 else softmax_scale
             )
-            # apply softmax
             ps = torch.softmax(logits, dim=2)
             ps = torch.dropout(ps, dropout_p, train=True)
-            
-            
-            if use_external:
-                # attn_weight_external: [B, Lq, Lk] -> [B, Lq, Lk, H]
-                ext = attn_weight_external.unsqueeze(-1).expand(-1, -1, -1, nhead)  # type: ignore[arg-type]
-                ps = external_gate * ps + (1.0 - external_gate) * ext  # pyright: ignore[reportOptionalOperand]
-            
             attention_head_outputs = torch.einsum("b q k h, b k h d -> b q h d", ps, v)
 
-        
         return attention_head_outputs.reshape(
             batch_size,
             seqlen_q,
@@ -756,3 +769,4 @@ class MultiHeadAttention(Attention):
             state_dict["_w_qkv"] = in_proj_weight
         state_dict["_w_out"] = out_proj_weight.T.reshape(nhead, -1, embed_dim)
         return state_dict
+    

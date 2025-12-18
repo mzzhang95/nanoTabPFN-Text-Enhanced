@@ -54,7 +54,7 @@ class NanoTabPFNModel(nn.Module):
             x = args[0]
             if args[2] is not None:
                 x = torch.cat((x, args[2]), dim=1)
-            return self._forward((x, args[1]), single_eval_pos=len(args[0]), **kwargs)
+            return self._forward((x, args[1]), single_eval_pos=args[0].shape[1], **kwargs)
         elif len(args) == 1 and isinstance(args, tuple):
             # case model((x,y), single_eval_pos=None)
             return self._forward(*args, **kwargs)
@@ -157,7 +157,7 @@ class TransformerEncoderStack(nn.Module):
         """ Instantiates num_layers many Transformer Blocks and stores them in a list so we can use them in the forward """
         super().__init__()
         self.transformer_blocks = nn.ModuleList()
-        for _ in range(num_layers)-1:
+        for _ in range(num_layers - 1):
             self.transformer_blocks.append(TransformerEncoderLayer(embedding_size, num_attention_heads, mlp_hidden_size))
 
         # MZ: last layer uses text enhanced attention
@@ -233,13 +233,13 @@ class TransformerEncoderLayer(nn.Module):
             device=device,
             dtype=dtype,
             bias=False,
+            text_enhanced=False,
         )
-        # MZ: set external gate to 0.5 as initial value
+
+        self.text_enhanced = text_enhanced
         if text_enhanced:
-            # MZ: initialize alpha as a trainable parameter
-            self.alpha = nn.Parameter(torch.zeros(1), device=device, dtype=dtype) if dtype is not None else torch.tensor(0.5, device=device)
-            # MZ: apply sigmoid to constrain it between 0 and 1 for ratio between regular and external attention
-            self.external_gate = nn.Parameter(self.alpha, requires_grad=True)
+            # Trainable per-head logit gate; sigmoid is applied at runtime to get (0,1).
+            self.external_gate = nn.Parameter(torch.zeros(nhead, device=device, dtype=dtype))
         else:
             self.external_gate = None
 
@@ -256,7 +256,7 @@ class TransformerEncoderLayer(nn.Module):
         single_eval_position: int,
         num_mem_chunks: int = 1,
         *,
-        text_attn_weight: torch.Tensor | None = None,
+        attn_weight_external: torch.Tensor | None = None,
         # MZ: removed external_gate argument since it is now a trainable parameter
         # external_gate: float | None = None,
     ) -> torch.Tensor:
@@ -294,8 +294,13 @@ class TransformerEncoderLayer(nn.Module):
         src = src.reshape(batch_size*col_size, rows_size, embedding_size)
         @memory_chunking(num_mem_chunks)
         def datapoint_attention(x):
-            # MZ: flag constant to indicate whether external attention is enabled. Only set to True if both text attention weights and external gate are given.
-            external_enabled = text_attn_weight is not None and self.external_gate is not None
+            ext = attn_weight_external
+            if ext is not None and ext.dim() == 2:
+                ext = ext.unsqueeze(0)
+
+            gate = None
+            if self.text_enhanced and self.external_gate is not None:
+                gate = torch.sigmoid(self.external_gate)  # (H,)
 
             # MZ: No text enhanced attention for training data
             x_left = self.self_attention_between_datapoints(
@@ -311,8 +316,8 @@ class TransformerEncoderLayer(nn.Module):
                 x[:, single_eval_position:],
                 x[:, :single_eval_position],
                 x[:, :single_eval_position],
-                attn_weight_external=text_attn_weight if external_enabled else None,
-                external_gate=self.external_gate if external_enabled else None,
+                attn_weight_external=ext if self.text_enhanced else None,
+                external_gate=gate if self.text_enhanced else None,
             )[0]
             return torch.cat([x_left, x_right], dim=1) + x
         src = datapoint_attention(src)
