@@ -192,7 +192,7 @@ class TransformerEncoderStack(nn.Module):
                     single_eval_position=single_eval_position,
                     num_mem_chunks=num_mem_chunks,
                     attn_weight_external=attn_weight_external,
-                    external_gate=external_gate,
+                    # external_gate=external_gate,
                 )
             else:
                 x = block(
@@ -236,8 +236,10 @@ class TransformerEncoderLayer(nn.Module):
         )
         # MZ: set external gate to 0.5 as initial value
         if text_enhanced:
-            init_gate = torch.tensor(0.5, device=device, dtype=dtype) if dtype is not None else torch.tensor(0.5, device=device)
-            self.external_gate = nn.Parameter(init_gate)
+            # MZ: initialize alpha as a trainable parameter
+            self.alpha = nn.Parameter(torch.zeros(1), device=device, dtype=dtype) if dtype is not None else torch.tensor(0.5, device=device)
+            # MZ: apply sigmoid to constrain it between 0 and 1 for ratio between regular and external attention
+            self.external_gate = nn.Parameter(self.alpha, requires_grad=True)
         else:
             self.external_gate = None
 
@@ -292,7 +294,7 @@ class TransformerEncoderLayer(nn.Module):
         src = src.reshape(batch_size*col_size, rows_size, embedding_size)
         @memory_chunking(num_mem_chunks)
         def datapoint_attention(x):
-            # MZ: flag constant to indicate whether external attention is enabled
+            # MZ: flag constant to indicate whether external attention is enabled. Only set to True if both text attention weights and external gate are given.
             external_enabled = text_attn_weight is not None and self.external_gate is not None
 
             # MZ: No text enhanced attention for training data
@@ -304,6 +306,7 @@ class TransformerEncoderLayer(nn.Module):
                 external_gate=None,
             )[0]
             # MZ: test data attends to the training data with external attention
+            # [0] to get the attn output, ignore attn weights
             x_right = self.self_attention_between_datapoints(
                 x[:, single_eval_position:],
                 x[:, :single_eval_position],

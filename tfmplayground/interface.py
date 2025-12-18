@@ -204,10 +204,17 @@ class NanoTabPFNRegressor():
         # Keep external_gate None to use the model's trainable gate parameter.
         self.external_gate: float | None = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_text: np.ndarray):
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray, train_text: np.ndarray):
         """
         Stores X_train and y_train for later use.
         Computes target normalization.
+        train_text: text embedding features aligned with X_train rows.
+            Preferred shape:
+            - (N_train, L, D): L text features per row (e.g., current text + lags), D embedding size
+
+            Also supported for convenience:
+            - (N_train, D): single text embedding per row (treated as L=1)
+            - (N_train, D, L): will be transposed to (N_train, L, D) via a heuristic
         """
         # MZ: the fit function only stores the training data, no forward pass is done here
         # MZ: treat numerical features same as before
@@ -216,13 +223,13 @@ class NanoTabPFNRegressor():
         self.y_train = y_train
 
         # MZ: our text enhanced module
-        self.X_text_train = np.array(X_text)
+        self.train_text = np.array(train_text)
 
         self.y_train_mean = np.mean(self.y_train)
         self.y_train_std = np.std(self.y_train, ddof=1) + 1e-8
         self.y_train_n = (self.y_train - self.y_train_mean) / self.y_train_std
 
-    def predict(self, X_test: np.ndarray, X_text_test: np.ndarray) -> np.ndarray:
+    def predict(self, X_test: np.ndarray, text_test: np.ndarray) -> np.ndarray:
         """
         Performs in-context learning using X_train and y_train.
         MZ: Pass text embeddings of test data for textenhanced attention calculation.
@@ -233,7 +240,7 @@ class NanoTabPFNRegressor():
         X = np.concatenate((self.X_train, self.feature_preprocessor.transform(X_test)))
         y = self.y_train_n
 
-        attn_weight_external = self._compute_attn_weight_external(X_text_test)
+        attn_weight_external = self._compute_attn_weight_external(text_test)
 
         with torch.no_grad():
             X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -244,36 +251,71 @@ class NanoTabPFNRegressor():
                 single_eval_pos=len(self.X_train),
                 num_mem_chunks=self.num_mem_chunks,
                 attn_weight_external=attn_weight_external,
-                external_gate=self.external_gate,
             ).squeeze(0)
             preds_n = self.dist.mean(logits)
             preds = preds_n * self.y_train_std + self.y_train_mean
 
         return preds.cpu().numpy()
     
-    def _compute_attn_weight_external(self, X_text_test: np.ndarray) -> torch.Tensor:
+    def _standardize_text_embeddings(self, x: np.ndarray, *, kind: str) -> np.ndarray:
         """
-        Computes external attention weights from text features for train+test rows.
-        Returns a tensor of shape (1, L, L) on the model device.
-        """
-        X_text_full = np.concatenate((self.X_text_train, np.array(X_text_test)))
-        X_tensor = torch.tensor(X_text_full, dtype=torch.float32, device=self.device)  # [L, F_text]
-        X_norm = torch.nn.functional.normalize(X_tensor, dim=1)
-        sim = X_norm @ X_norm.T  # [L, L]
-        attn = torch.softmax(sim, dim=-1).unsqueeze(0)  # [1, L, L]
-        return attn
+        Convert text embeddings to shape (N, L, D).
 
-    def build_fake_attn_weight(self, num_test_rows: int, fill_value: float = 0.0) -> torch.Tensor:
+        Accepts:
+        - (N, D) -> (N, 1, D)
+        - (N, L, D) -> (N, L, D)
+        - (N, D, L) -> (N, L, D) (heuristic: L is the smaller of the last two dims)
         """
-        Utility to create a fake external attention weight when no text is available.
-        Produces a uniform (softmaxed) matrix of shape (1, L, L) on the correct device.
+        x = np.asarray(x)
+        if x.ndim == 2:
+            return x[:, None, :]
+        if x.ndim != 3:
+            raise ValueError(f"{kind} text embeddings must be shaped (N, D), (N, T, D), or (N, D, T). Got {x.shape}.")
+
+        n, a, b = x.shape
+        # Heuristic: number of text features L is usually small (lags), embedding dim D is larger.
+        if a <= b:
+            # assume (N, T, D)
+            return x
+        # assume (N, D, T)
+        return np.transpose(x, (0, 2, 1))
+
+    def _compute_text_similarity_external(self, text_test: np.ndarray) -> torch.Tensor:
         """
-        train_len = len(self.X_train)
-        total_len = train_len + num_test_rows
-        base = torch.full(
-            (1, total_len, total_len),
-            fill_value,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        return torch.softmax(base, dim=-1)
+        Cosine similarity between test and train text embeddings, per text feature.
+
+        Returns:
+            torch.Tensor shaped (L, N_test, N_train), where L = num_text_features.
+        """
+        train = self._standardize_text_embeddings(self.train_text, kind="train")
+        test = self._standardize_text_embeddings(text_test, kind="test")
+
+        if train.shape[1:] != test.shape[1:]:
+            raise ValueError(
+                "Train/test text embeddings must match on (T, D). "
+                f"Got train={train.shape}, test={test.shape}."
+            )
+
+        train_tensor = torch.tensor(train, dtype=torch.float32, device=self.device)  # (N_train, T, D)
+        test_tensor = torch.tensor(test, dtype=torch.float32, device=self.device)  # (N_test, T, D)
+
+        train_norm = F.normalize(train_tensor, dim=-1)
+        test_norm = F.normalize(test_tensor, dim=-1)
+
+        # (L, N_test, N_train): cosine similarity for each text feature independently.
+        return torch.einsum("n t d, m t d -> t n m", test_norm, train_norm)
+
+    def _compute_attn_weight_external(self, text_test: np.ndarray) -> torch.Tensor:
+        """
+        Compute external attention weights from text embeddings (cosine-softmax).
+
+        The returned tensor is suitable for the model's test->train attention call, i.e.
+        it has shape (1, N_test, N_train).
+
+        If there are multiple text features per row (e.g., lags), cosine similarity is
+        computed per text feature, yielding a matrix of shape (L, N_test, N_train),
+        and then averaged over L before applying softmax over the train dimension.
+        """
+        sim_by_text_feature = self._compute_text_similarity_external(text_test)  # (T, N_test, N_train)
+        logits = sim_by_text_feature.mean(dim=0)  # (N_test, N_train)
+        return torch.softmax(logits, dim=-1).unsqueeze(0)

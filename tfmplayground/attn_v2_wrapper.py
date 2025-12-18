@@ -8,12 +8,13 @@ from tfmplayground.attn_v2 import PFNAttentionConfig, MultiHeadAttention as PFNM
 
 
 class _PFNMultiHeadAttentionV2Safe(PFNMultiHeadAttentionV2):
-    """MZ: All further updates are made to PFNMultiHeadAttentionV2 to make it safe. No update on PFNMultiHeadAttentionV2 itself should be made."""
+    """MZ: All further updates are made to PFNMultiHeadAttentionV2 to make it safe.
+       No update on PFNMultiHeadAttentionV2 itself should be made."""
 
     def forward(  # noqa: PLR0913
         self,
         x: torch.Tensor,
-        x_kv: torch.Tensor | None = None,
+        x_kv: torch.Tensor | None = None, 
         *,
         cache_kv: bool = False,
         add_input: bool = False,
