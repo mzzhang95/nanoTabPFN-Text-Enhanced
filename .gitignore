@@ -4,6 +4,7 @@ wandb/
 logs/
 log/
 runs/
+build/
 tfmplayground_jobs/
 *.pth
 *.h5
@@ -16,7 +17,9 @@ __pycache__/
 *.egg-info/
 
 *.zip
+*.csv
 
 .DS_Store
 
 uv.lock
+ticl/

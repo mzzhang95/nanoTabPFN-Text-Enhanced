@@ -29,6 +29,11 @@ dependencies = [
 [project.optional-dependencies]
 wandb = ["wandb>=0.20"]
 tensorboard = ["tensorboard>=2.19"]
+embeddings = [
+    "transformers>=4.44",
+    "sentence-transformers>=3.0",
+    "pandas>=2.0",
+]
 [project.urls]
 Homepage = "https://github.com/automl/TFM-Playground"
 Issues = "https://github.com/automl/TFM-Playground/issues"
